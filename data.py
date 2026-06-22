@@ -2,6 +2,9 @@ import pandas as pd
 import re
 import os
 import requests
+import numpy as np
+from scipy.optimize import minimize
+from scipy.stats import poisson as poisson_dist
 
 def load_data(filepath='ssfa_full.csv'):
     df = pd.read_csv(filepath)
@@ -304,7 +307,95 @@ def predict_score(home, away, summary, form_summary, df):
     return max(0, int(hg)), max(0, int(ag))
 
 
-def make_auto_predictions(schedule, df, df_byes, summary, form_summary):
+def fit_poisson_model(df, decay=0.0):
+    """
+    Fit a Dixon-Coles style Poisson regression model.
+    Each team gets an attack and defence strength parameter.
+    Expected goals: exp(intercept + attack_home - defence_away + home_adv)
+
+    decay: exponential time-decay rate per round (0 = no decay).
+           Each game is weighted exp(-decay * rounds_ago) so recent
+           games matter more. Typical useful range: 0.0–0.3.
+
+    Returns a params dict, or None if too few games/teams.
+    """
+    teams = sorted(
+        t for t in set(df['Home'].unique()) | set(df['Away'].unique())
+        if 'TITANS' not in str(t) and t != 'BYE'
+    )
+    n = len(teams)
+    if n < 2:
+        return None
+
+    games = df[
+        ~df['Home'].str.contains('TITANS', na=False) &
+        ~df['Away'].str.contains('TITANS', na=False) &
+        (df['Home'] != 'BYE') & (df['Away'] != 'BYE')
+    ].copy()
+
+    if len(games) < n:
+        return None
+
+    idx = {t: i for i, t in enumerate(teams)}
+
+    max_round = games['Round'].max()
+    weights = np.exp(-decay * (max_round - games['Round'].values))
+
+    home_arr = games['Home'].values
+    away_arr = games['Away'].values
+    hg_arr   = games['HG'].values.astype(int)
+    ag_arr   = games['AG'].values.astype(int)
+    hi_arr   = np.array([idx.get(h, -1) for h in home_arr])
+    ai_arr   = np.array([idx.get(a, -1) for a in away_arr])
+    valid    = (hi_arr >= 0) & (ai_arr >= 0)
+
+    # params layout: [home_adv, intercept, attack_1..n-1, defence_0..n-1]
+    # attack[0] fixed at 0 for identifiability
+    def neg_ll(params):
+        home_adv = params[0]
+        intercept = params[1]
+        attack = np.concatenate([[0.0], params[2:n + 1]])
+        defence = params[n + 1:]
+        lh = np.exp(intercept + attack[hi_arr[valid]] - defence[ai_arr[valid]] + home_adv)
+        la = np.exp(intercept + attack[ai_arr[valid]] - defence[hi_arr[valid]])
+        ll = weights[valid] * (
+            poisson_dist.logpmf(hg_arr[valid], lh) +
+            poisson_dist.logpmf(ag_arr[valid], la)
+        )
+        return -ll.sum()
+
+    x0 = np.zeros(1 + 1 + (n - 1) + n)
+    x0[0] = 0.1
+    x0[1] = np.log(max(games['HG'].mean(), 0.5))
+
+    result = minimize(neg_ll, x0, method='L-BFGS-B', options={'maxiter': 2000, 'ftol': 1e-12})
+
+    p = result.x
+    return {
+        'teams': teams,
+        'idx': idx,
+        'home_adv': p[0],
+        'intercept': p[1],
+        'attack': np.concatenate([[0.0], p[2:n + 1]]),
+        'defence': p[n + 1:],
+        'decay': decay,
+    }
+
+
+def predict_score_poisson(home, away, model):
+    """Predict a scoreline using a fitted Poisson model."""
+    if model is None:
+        return 1, 1
+    hi = model['idx'].get(home)
+    ai = model['idx'].get(away)
+    if hi is None or ai is None:
+        return 1, 1
+    lh = np.exp(model['intercept'] + model['attack'][hi] - model['defence'][ai] + model['home_adv'])
+    la = np.exp(model['intercept'] + model['attack'][ai] - model['defence'][hi])
+    return max(0, round(lh)), max(0, round(la))
+
+
+def make_auto_predictions(schedule, df, df_byes, summary, form_summary, poisson_model=None):
     played_rounds = set(df['Round'].unique())
     remaining = schedule[~schedule['Round'].isin(played_rounds)].copy()
 
@@ -326,7 +417,10 @@ def make_auto_predictions(schedule, df, df_byes, summary, form_summary):
                 'AG': 0 if a == 'BYE' else 3,
             })
         else:
-            hg, ag = predict_score(h, a, summary, form_summary, df)
+            if poisson_model is not None:
+                hg, ag = predict_score_poisson(h, a, poisson_model)
+            else:
+                hg, ag = predict_score(h, a, summary, form_summary, df)
             predictions.append({
                 'Round': row['Round'],
                 'Home': h,

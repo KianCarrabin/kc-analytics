@@ -5,7 +5,7 @@ import base64
 import shutil
 import streamlit as st
 import plotly.express as px
-from data import load_data, get_leagues, filter_league, make_long, make_summary, make_full_schedule, make_fixture_tracker, make_form, make_auto_predictions, predict_score, get_age_groups, get_grades, make_movement, get_team_color, get_carry_over_stats, get_weather
+from data import load_data, get_leagues, filter_league, make_long, make_summary, make_full_schedule, make_fixture_tracker, make_form, make_auto_predictions, predict_score, fit_poisson_model, predict_score_poisson, get_age_groups, get_grades, make_movement, get_team_color, get_carry_over_stats, get_weather
 
 @st.cache_data
 def load_cached_data():
@@ -63,7 +63,8 @@ color_map = {team: get_team_color(team) for team in summary['Team'].tolist()}
 schedule, total_rounds = make_full_schedule(df, df_league, df_byes, summary, df_raw=df_raw, league=selected_league)
 tracker = make_fixture_tracker(schedule, df, df_byes, summary, total_rounds)
 form_summary = make_form(long)
-auto_predictions = make_auto_predictions(schedule, df, df_byes, summary, form_summary)
+poisson_model = fit_poisson_model(df)
+auto_predictions = make_auto_predictions(schedule, df, df_byes, summary, form_summary, poisson_model)
 movement = make_movement(long, summary, carry_over)
 
 chart = None
